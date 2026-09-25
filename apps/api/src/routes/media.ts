@@ -97,14 +97,17 @@ export async function mediaRoutes(app: FastifyInstance) {
       throw new AppError(400, "VALIDATION_FAILED", "Uploaded object content type does not match the declared type");
     }
 
-    await transaction(async (client) => {
-      await client.query(
+    const attempt = await transaction(async (client) => {
+      // 条件 UPDATE 是状态机权威：并发 complete 只有一个事务能从 quarantined 抢占成功，
+      // 行锁串行化竞争，落选者得到 0 行。
+      const claim = await client.query<{ attempt: number }>(
         `UPDATE media_assets
          SET privacy_status = 'processing',
              privacy_report = $2::jsonb,
              failure_code = NULL,
              updated_at = now()
-         WHERE id = $1`,
+         WHERE id = $1 AND privacy_status = 'quarantined' AND deleted_at IS NULL
+         RETURNING processing_attempt AS attempt`,
         [params.id, JSON.stringify({
           manualRegions: input.privacyRegions,
           containsPeopleOrPlates: input.containsPeopleOrPlates,
@@ -112,25 +115,30 @@ export async function mediaRoutes(app: FastifyInstance) {
           detector: "pending"
         })]
       );
+      if (claim.rowCount === 0) return null;
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.processing_requested",
         resourceType: "media",
         resourceId: params.id,
-        metadata: { regionCount: input.privacyRegions.length }
+        metadata: { regionCount: input.privacyRegions.length, attempt: claim.rows[0]!.attempt }
       });
+      return claim.rows[0]!.attempt;
     });
+    if (attempt === null) throw conflict("Media upload was already completed");
 
     try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}`);
+      await enqueueMediaProcessing(params.id, attempt);
     } catch (error) {
       await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
-        [params.id]
+        `UPDATE media_assets
+         SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now()
+         WHERE id = $1 AND processing_attempt = $2`,
+        [params.id, attempt]
       );
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
     }
-    return { status: "processing" };
+    return { status: "processing", attempt };
   });
 
   app.get("/media/:id", { preHandler: requireAuth }, async (request) => {
@@ -160,18 +168,49 @@ export async function mediaRoutes(app: FastifyInstance) {
     const row = result.rows[0];
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
-    if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
-    await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
-    try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
-    } catch (error) {
-      await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
+    if (!["failed", "rejected"].includes(row.privacy_status)) {
+      throw conflict("Only failed media can be retried");
+    }
+
+    // 条件 UPDATE + 审计在同一事务中完成状态转换。并发重试由行锁串行化：
+    // 只有一个请求能把 failed/rejected 推进到 processing 并拿到新的处理代次。
+    const attempt = await transaction(async (client) => {
+      const claim = await client.query<{ attempt: number }>(
+        `UPDATE media_assets
+         SET privacy_status = 'processing',
+             processing_attempt = processing_attempt + 1,
+             failure_code = NULL,
+             updated_at = now()
+         WHERE id = $1 AND privacy_status IN ('failed', 'rejected') AND deleted_at IS NULL
+         RETURNING processing_attempt AS attempt`,
         [params.id]
+      );
+      if (claim.rowCount === 0) return null;
+      await recordAudit(client, {
+        actorId: request.user!.id,
+        action: "media.retried",
+        resourceType: "media",
+        resourceId: params.id,
+        metadata: { attempt: claim.rows[0]!.attempt, previousStatus: row.privacy_status }
+      });
+      return claim.rows[0]!.attempt;
+    });
+    if (attempt === null) throw conflict("Media is already being processed");
+
+    try {
+      // 幂等键与处理代次绑定：并发/重复重试同代次只产生一个 BullMQ 作业
+      await enqueueMediaProcessing(params.id, attempt);
+    } catch (error) {
+      // 仅当状态仍属于本次代次时回滚，避免覆盖更新的状态（例如已被恢复流程接管）
+      await query(
+        `UPDATE media_assets
+         SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now()
+         WHERE id = $1 AND processing_attempt = $2 AND privacy_status = 'processing'`,
+        [params.id, attempt]
       );
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
     }
-    return { status: "processing" };
+    return { status: "processing", attempt };
   });
 
   app.get("/media/:id/preview", { preHandler: requireModerator }, async (request) => {
@@ -218,30 +257,58 @@ export async function mediaRoutes(app: FastifyInstance) {
 
     const publicKey = `media/${params.id}.webp`;
     const thumbnailKey = `media/${params.id}.thumb.webp`;
+
+    // 先在事务内做条件状态转换：并发批准只有一个能从 manual_review 抢占成功。
+    const claimed = await transaction(async (client) => {
+      const claim = await client.query(
+        `UPDATE media_assets
+         SET privacy_status = 'ready', updated_at = now()
+         WHERE id = $1 AND privacy_status = 'manual_review' AND deleted_at IS NULL
+         RETURNING id`,
+        [params.id]
+      );
+      if (claim.rowCount === 0) return false;
+      await recordAudit(client, {
+        actorId: request.user!.id,
+        action: "media.privacy_approved",
+        resourceType: "media",
+        resourceId: params.id
+      });
+      return true;
+    });
+    if (!claimed) throw conflict("Media is not waiting for manual privacy approval");
+
     try {
       await publishMediaObject(media.processed_object_key, publicKey);
       if (media.thumbnail_object_key) await publishMediaObject(media.thumbnail_object_key, thumbnailKey);
 
-      await transaction(async (client) => {
-        await client.query(
-          `UPDATE media_assets
-           SET privacy_status = 'ready', public_object_key = $2,
-               public_thumbnail_object_key = $3, processed_at = now(), updated_at = now()
-           WHERE id = $1`,
-          [params.id, publicKey, media.thumbnail_object_key ? thumbnailKey : null]
-        );
-        await recordAudit(client, {
-          actorId: request.user!.id,
-          action: "media.privacy_approved",
-          resourceType: "media",
-          resourceId: params.id
-        });
-      });
+      const result = await query(
+        `UPDATE media_assets
+         SET public_object_key = $2,
+             public_thumbnail_object_key = $3, processed_at = now(), updated_at = now()
+         WHERE id = $1 AND privacy_status = 'ready' AND public_object_key IS NULL`,
+        [params.id, publicKey, media.thumbnail_object_key ? thumbnailKey : null]
+      );
+      if (result.rowCount === 0) {
+        // 并发批准已完成发布；清理本次重复拷贝，保留已有公开对象
+        await Promise.allSettled([
+          deleteObject(config.S3_PUBLIC_BUCKET, publicKey),
+          media.thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, thumbnailKey) : Promise.resolve()
+        ]);
+      }
     } catch (error) {
       await Promise.allSettled([
         deleteObject(config.S3_PUBLIC_BUCKET, publicKey),
         media.thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, thumbnailKey) : Promise.resolve()
       ]);
+      // 发布失败：回滚到人工审核队列，避免留下没有公开对象的 ready 行；
+      // 此前的 media.privacy_approved 审计保留了操作痕迹。
+      await query(
+        `UPDATE media_assets
+         SET privacy_status = 'manual_review', processed_at = NULL, updated_at = now()
+         WHERE id = $1 AND privacy_status = 'ready' AND public_object_key IS NULL`,
+        [params.id]
+      );
       throw error;
     }
 
@@ -283,15 +350,26 @@ export async function mediaRoutes(app: FastifyInstance) {
       throw conflict("Media attached to published content cannot be deleted separately");
     }
 
-    await transaction(async (client) => {
-      await client.query("UPDATE media_assets SET privacy_status = 'deleted', deleted_at = now(), updated_at = now() WHERE id = $1", [params.id]);
+    const deleted = await transaction(async (client) => {
+      // 条件翻转：并发删除只产生一次审计；处理中的媒体不允许与删除竞争。
+      const claim = await client.query(
+        `UPDATE media_assets
+         SET privacy_status = 'deleted', deleted_at = now(), updated_at = now()
+         WHERE id = $1 AND deleted_at IS NULL
+           AND privacy_status NOT IN ('scanning', 'processing')
+         RETURNING id`,
+        [params.id]
+      );
+      if (claim.rowCount === 0) return false;
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.deleted",
         resourceType: "media",
         resourceId: params.id
       });
+      return true;
     });
+    if (!deleted) throw conflict("Media is being processed or was already deleted");
 
     const removals = [
       deleteObject(config.S3_QUARANTINE_BUCKET, media.quarantine_object_key),

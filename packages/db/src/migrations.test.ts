@@ -28,6 +28,25 @@ describe("initial migration", () => {
     expect(followup).toContain("updated_at timestamptz");
   });
 
+  it("adds the processing attempt generation column and stuck-job index in migration 0003", () => {
+    const followup = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_media_processing_attempt.sql"),
+      "utf8"
+    );
+    expect(followup).toContain("ADD COLUMN processing_attempt integer NOT NULL DEFAULT 1");
+    expect(followup).toContain("media_assets_active_stuck_idx");
+  });
+
+  it("migration 0003 collapses duplicate processing audit history", () => {
+    const followup = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_media_processing_attempt.sql"),
+      "utf8"
+    );
+    expect(followup).toContain("DELETE FROM audit_logs");
+    expect(followup).toContain("'media.processing_requested'");
+    expect(followup).toContain("row_number()");
+  });
+
   it("uses PostGIS geography points and spatial indexes", () => {
     expect(migration).toContain("geography(Point, 4326)");
     expect(migration).toContain("USING gist (geom)");

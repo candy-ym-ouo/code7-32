@@ -1,5 +1,6 @@
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
+import { mediaJobId } from "@map/shared";
 import { config } from "./config";
 
 const redisOptions = { maxRetriesPerRequest: null } as const;
@@ -20,10 +21,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   ]);
 }
 
-export async function enqueueMediaProcessing(mediaId: string, jobId: string): Promise<void> {
+export async function enqueueMediaProcessing(mediaId: string, attempt: number): Promise<void> {
   await withTimeout(
-    mediaQueue.add("process", { mediaId }, {
-      jobId,
+    mediaQueue.add("process", { mediaId, attempt }, {
+      jobId: mediaJobId(mediaId, attempt),
       removeOnComplete: 1000,
       removeOnFail: 1000
     }),

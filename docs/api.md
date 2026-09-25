@@ -62,6 +62,14 @@
 | `POST` | `/media/:id/retry` | 重试失败处理 |
 | `DELETE` | `/media/:id` | 删除媒体对象 |
 
+媒体处理接口的并发约定：
+
+- `complete`、`retry`、`privacy-approve` 和 `DELETE` 的状态转换均为条件更新，
+  并发请求中只有一个成功，其余返回 `409 CONFLICT`，客户端按幂等重试即可。
+- `complete` 与 `retry` 的响应包含 `attempt`（处理代次，从 1 开始单调递增），
+  队列作业以 `media:<id>:<attempt>` 为幂等键，重复提交同代次请求不会启动多个处理任务。
+- 仅 `failed`/`rejected` 媒体可重试；处于 `scanning`/`processing` 的媒体不可删除。
+
 ## 评论、举报和通知
 
 | 方法 | 路径 | 说明 |
