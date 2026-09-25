@@ -59,7 +59,7 @@
 | `GET` | `/media/:id` | 查询处理状态 |
 | `GET` | `/media/:id/preview` | 审核员获取短期私有预览 |
 | `POST` | `/media/:id/privacy-approve` | 审核员确认隐私并发布派生图 |
-| `POST` | `/media/:id/retry` | 重试失败处理 |
+| `POST` | `/media/:id/retry` | 重试失败处理（幂等：并发重试只会启动一个处理任务，已在处理中时返回 200） |
 | `DELETE` | `/media/:id` | 删除媒体对象 |
 
 ## 评论、举报和通知

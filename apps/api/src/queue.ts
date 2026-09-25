@@ -1,5 +1,6 @@
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
+import { MEDIA_PROCESSING_JOB_NAME, mediaProcessingJobId } from "@map/shared/media-jobs";
 import { config } from "./config";
 
 const redisOptions = { maxRetriesPerRequest: null } as const;
@@ -20,10 +21,15 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   ]);
 }
 
-export async function enqueueMediaProcessing(mediaId: string, jobId: string): Promise<void> {
+/**
+ * Enqueues the processing job for one claimed attempt. The job id is
+ * deterministic per (media, attempt), so calling this twice for the same
+ * attempt is a no-op and can never create a duplicate job.
+ */
+export async function enqueueMediaProcessing(mediaId: string, attempt: number): Promise<void> {
   await withTimeout(
-    mediaQueue.add("process", { mediaId }, {
-      jobId,
+    mediaQueue.add(MEDIA_PROCESSING_JOB_NAME, { mediaId, attempt }, {
+      jobId: mediaProcessingJobId(mediaId, attempt),
       removeOnComplete: 1000,
       removeOnFail: 1000
     }),

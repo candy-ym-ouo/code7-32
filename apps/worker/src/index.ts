@@ -22,7 +22,8 @@ const mediaQueue = new Queue("media", { connection: queueConnection });
 
 const mediaWorker = new Worker("media", async (job) => {
   if (job.name !== "process") return;
-  await processMediaJob(String(job.data.mediaId));
+  const attempt = job.data?.attempt == null ? undefined : Number(job.data.attempt);
+  await processMediaJob(String(job.data.mediaId), attempt);
 }, { connection: mediaWorkerConnection, concurrency: 2 });
 
 const outboxWorker = new Worker("outbox", async (job) => {
@@ -33,15 +34,6 @@ const outboxWorker = new Worker("outbox", async (job) => {
 mediaWorker.on("failed", (job, error) => console.error({ jobId: job?.id, error }, "media job failed"));
 outboxWorker.on("failed", (job, error) => console.error({ jobId: job?.id, error }, "outbox job failed"));
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_resolve, reject) => {
-      setTimeout(() => reject(new Error(`Redis queue operation timed out after ${timeoutMs}ms`)), timeoutMs).unref();
-    })
-  ]);
-}
-
 let maintenanceRunning = false;
 
 async function maintenanceTick() {
@@ -50,14 +42,8 @@ async function maintenanceTick() {
   try {
     await recoverStuckOutbox();
     await dispatchOutbox();
-    const stuckMedia = await recoverStuckMedia();
-    for (const mediaId of stuckMedia) {
-      await withTimeout(mediaQueue.add("process", { mediaId }, {
-        jobId: `media-recover-${mediaId}-${Date.now()}`,
-        removeOnComplete: 1000,
-        removeOnFail: 1000
-      }), 3_000);
-    }
+    const recoveredMedia = await recoverStuckMedia(mediaQueue);
+    if (recoveredMedia.length) console.log({ recoveredMedia }, "recovered stuck media");
     await cleanupOriginalMedia();
     await markUnreferencedMediaDeleted();
     await cleanupDeletedMediaObjects();

@@ -5,6 +5,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./contracts": "./src/contracts.ts",
+    "./media-jobs": "./src/media-jobs.ts",
     "./server": "./src/server.ts"
   },
   "scripts": {

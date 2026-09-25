@@ -15,6 +15,7 @@ import {
   publicMediaUrl
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
+import { claimMediaProcessing, failMediaProcessingClaim } from "../media-processing";
 import { recordAudit } from "../audit";
 
 function extensionForMime(mime: string) {
@@ -97,37 +98,30 @@ export async function mediaRoutes(app: FastifyInstance) {
       throw new AppError(400, "VALIDATION_FAILED", "Uploaded object content type does not match the declared type");
     }
 
-    await transaction(async (client) => {
-      await client.query(
-        `UPDATE media_assets
-         SET privacy_status = 'processing',
-             privacy_report = $2::jsonb,
-             failure_code = NULL,
-             updated_at = now()
-         WHERE id = $1`,
-        [params.id, JSON.stringify({
-          manualRegions: input.privacyRegions,
-          containsPeopleOrPlates: input.containsPeopleOrPlates,
-          rightsConfirmedAt: new Date().toISOString(),
-          detector: "pending"
-        })]
-      );
-      await recordAudit(client, {
-        actorId: request.user!.id,
-        action: "media.processing_requested",
-        resourceType: "media",
-        resourceId: params.id,
-        metadata: { regionCount: input.privacyRegions.length }
-      });
+    const claim = await claimMediaProcessing({
+      mediaId: params.id,
+      actorId: request.user!.id,
+      fromStatuses: ["quarantined"],
+      action: "media.processing_requested",
+      metadata: { regionCount: input.privacyRegions.length },
+      privacyReport: {
+        manualRegions: input.privacyRegions,
+        containsPeopleOrPlates: input.containsPeopleOrPlates,
+        rightsConfirmedAt: new Date().toISOString(),
+        detector: "pending"
+      }
     });
+    if (!claim) throw conflict("Media upload was already completed");
 
     try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}`);
+      await enqueueMediaProcessing(params.id, claim.attempt);
     } catch (error) {
-      await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
-        [params.id]
-      );
+      await failMediaProcessingClaim({
+        mediaId: params.id,
+        attempt: claim.attempt,
+        actorId: request.user!.id,
+        failureCode: "QUEUE_UNAVAILABLE"
+      });
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
     }
     return { status: "processing" };
@@ -161,14 +155,38 @@ export async function mediaRoutes(app: FastifyInstance) {
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
     if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
-    await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
-    try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
-    } catch (error) {
-      await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
+
+    // The claim is the authoritative guard: exactly one concurrent request can
+    // move the asset out of failed/rejected, and it gets a fresh processing
+    // attempt (idempotency key) for the queue job.
+    const claim = await claimMediaProcessing({
+      mediaId: params.id,
+      actorId: request.user!.id,
+      fromStatuses: ["failed", "rejected"],
+      action: "media.retry_requested"
+    });
+    if (!claim) {
+      // A concurrent request transitioned the asset first. If that was another
+      // retry, processing is already underway, so report success instead of
+      // starting a duplicate task.
+      const current = await query<{ privacy_status: string }>(
+        "SELECT privacy_status FROM media_assets WHERE id = $1 AND deleted_at IS NULL",
         [params.id]
       );
+      const status = current.rows[0]?.privacy_status;
+      if (status === "processing" || status === "scanning") return { status: "processing" };
+      throw conflict("Only failed media can be retried");
+    }
+
+    try {
+      await enqueueMediaProcessing(params.id, claim.attempt);
+    } catch (error) {
+      await failMediaProcessingClaim({
+        mediaId: params.id,
+        attempt: claim.attempt,
+        actorId: request.user!.id,
+        failureCode: "QUEUE_UNAVAILABLE"
+      });
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
     }
     return { status: "processing" };

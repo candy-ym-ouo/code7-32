@@ -28,6 +28,15 @@ describe("initial migration", () => {
     expect(followup).toContain("updated_at timestamptz");
   });
 
+  it("adds the media processing attempt epoch in migration 0003", () => {
+    const followup = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_media_processing_attempts.sql"),
+      "utf8"
+    );
+    expect(followup).toContain("processing_attempt integer NOT NULL DEFAULT 0");
+    expect(followup).toContain("UPDATE media_assets");
+  });
+
   it("uses PostGIS geography points and spatial indexes", () => {
     expect(migration).toContain("geography(Point, 4326)");
     expect(migration).toContain("USING gist (geom)");

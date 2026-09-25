@@ -1,25 +1,33 @@
+import type { Queue } from "bullmq";
 import type { PrivacyRegion } from "@map/shared/contracts";
+import { MEDIA_PROCESSING_JOB_NAME, mediaProcessingJobId } from "@map/shared/media-jobs";
 import { config } from "./config";
 import { pool } from "./db";
 import { deleteObject, objectExists, readQuarantineObject, writeQuarantineObject, copyToPublic } from "./storage";
 import { scanForMalware } from "./clamav";
 import { processPrivacyImage } from "./privacy";
 
-export async function processMediaJob(mediaId: string): Promise<void> {
-  const result = await pool.query<{
-    id: string;
-    privacy_status: string;
+export async function processMediaJob(mediaId: string, attempt?: number): Promise<void> {
+  // Atomically claim the asset: exactly one concurrent job can move it out of
+  // a processable state. Jobs from superseded attempts (a newer retry already
+  // bumped processing_attempt) and historical duplicate jobs both lose the
+  // claim and skip. Legacy jobs without an attempt keep the previous behavior.
+  const claim = await pool.query<{
     quarantine_object_key: string;
     privacy_report: { manualRegions?: PrivacyRegion[] } | null;
   }>(
-    `SELECT id, privacy_status, quarantine_object_key, privacy_report
-     FROM media_assets WHERE id = $1 AND deleted_at IS NULL`,
-    [mediaId]
+    `UPDATE media_assets
+     SET privacy_status = 'scanning', updated_at = now()
+     WHERE id = $1
+       AND deleted_at IS NULL
+       AND privacy_status IN ('processing', 'failed')
+       AND ($2::integer IS NULL OR processing_attempt = $2)
+     RETURNING quarantine_object_key, privacy_report`,
+    [mediaId, attempt ?? null]
   );
-  const media = result.rows[0];
-  if (!media) throw new Error("Media record not found");
-  if (!["processing", "failed"].includes(media.privacy_status)) {
-    console.log(`skip media ${mediaId}: status=${media.privacy_status}`);
+  const media = claim.rows[0];
+  if (!media) {
+    console.log(`skip media ${mediaId}: already claimed or not processable`);
     return;
   }
 
@@ -28,7 +36,6 @@ export async function processMediaJob(mediaId: string): Promise<void> {
   const publicThumbnailKey = `media/${mediaId}.thumb.webp`;
 
   try {
-    await pool.query("UPDATE media_assets SET privacy_status = 'scanning', updated_at = now() WHERE id = $1", [mediaId]);
     const source = await readQuarantineObject(media.quarantine_object_key);
     await scanForMalware(source);
 
@@ -163,16 +170,53 @@ export async function markStaleFeatures(): Promise<void> {
   );
 }
 
-export async function recoverStuckMedia(): Promise<string[]> {
-  const result = await pool.query<{ id: string }>(
-    `UPDATE media_assets
-     SET privacy_status = 'processing', failure_code = 'Recovered after worker timeout', updated_at = now()
+/**
+ * Re-enqueues media whose database state is stuck in an in-flight status.
+ *
+ * The deterministic job id makes this safe to run on every maintenance tick:
+ * if the job for the current attempt is still queued or running, the row is
+ * not orphaned and is left alone; if the retained terminal job would block a
+ * re-add, it is removed first. Historical duplicate jobs created before
+ * deterministic job ids are neutralized by the atomic claim in
+ * processMediaJob: only one of them can win the status transition.
+ */
+export async function recoverStuckMedia(mediaQueue: Queue): Promise<string[]> {
+  const stuck = await pool.query<{ id: string; processing_attempt: number }>(
+    `SELECT id, processing_attempt FROM media_assets
      WHERE privacy_status IN ('scanning', 'processing')
        AND updated_at < now() - interval '20 minutes'
        AND deleted_at IS NULL
-     RETURNING id`
+     LIMIT 50`
   );
-  return result.rows.map((row) => row.id);
+  const recovered: string[] = [];
+  for (const row of stuck.rows) {
+    const jobId = mediaProcessingJobId(row.id, row.processing_attempt);
+    try {
+      const existing = await mediaQueue.getJob(jobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (state !== "completed" && state !== "failed" && state !== "unknown") {
+          continue;
+        }
+        await existing.remove();
+      }
+      await pool.query(
+        `UPDATE media_assets
+         SET privacy_status = 'processing', failure_code = 'Recovered after worker timeout', updated_at = now()
+         WHERE id = $1 AND privacy_status IN ('scanning', 'processing') AND deleted_at IS NULL`,
+        [row.id]
+      );
+      await mediaQueue.add(MEDIA_PROCESSING_JOB_NAME, { mediaId: row.id, attempt: row.processing_attempt }, {
+        jobId,
+        removeOnComplete: 1000,
+        removeOnFail: 1000
+      });
+      recovered.push(row.id);
+    } catch (error) {
+      console.error({ mediaId: row.id, error }, "failed to recover stuck media");
+    }
+  }
+  return recovered;
 }
 
 export async function cleanupDeletedMediaObjects(): Promise<void> {
